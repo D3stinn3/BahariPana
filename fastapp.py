@@ -114,7 +114,7 @@ ipfs_gateways = [
 
 
 # Create IPFS download function
-async def ipfs_resolve(image_url):
+async def ipfs_resolve(session,image_url):
     cid = image_url.removeprefix("https://ipfs.io/ipfs/")
     for gateway in ipfs_gateways:
         request = requests.get(f"https://{gateway}/ipfs/{cid}")

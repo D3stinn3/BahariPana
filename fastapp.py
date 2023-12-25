@@ -9,6 +9,7 @@ import argparse
 import aiohttp
 import asyncio
 
+
 # This creates a new Scraper instance that can get past the OpenSea Cloudflare protections
 scraper = cloudscraper.create_scraper(
     browser={

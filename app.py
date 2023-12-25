@@ -72,7 +72,9 @@ if not os.path.exists(f'./images/{CollectionName}/image_data'):
 count = int(collectioninfo["total_supply"])
 # Opensea limits to 30 assets per API request, so here we do the division and round up.
 
-iter = math.ceil(count / 30)
+initial_count = count / 200
+
+iter = math.ceil(count / 200)
 
 print(f"\nBeginning download of \"{CollectionName}\" collection.\n")
 
@@ -110,7 +112,7 @@ ipfs_gateways = [
 
 # Create IPFS download function
 def ipfs_resolve(image_url):
-    cid = image_url.removeprefix("ipfs://")
+    cid = image_url.removeprefix("https://ipfs.io/ipfs/")
     for gateway in ipfs_gateways:
         request = requests.get(f"https://{gateway}/ipfs/{cid}")
         if request.status_code == 200:
@@ -120,19 +122,21 @@ def ipfs_resolve(image_url):
 
 # Iterate through every unit
 for i in range(iter):
-    offset = i * 30
-    token_ids = ""
-    for j in range(offset, offset + 30):
-        if j < count:  # Check if the token ID is within the total supply
-            token_ids += f"&token_ids={j}"
+    offset = i * 200
+    limit = f"limit=200&offset={offset}"
 
-    data = json.loads(scraper.get(f"https://api.opensea.io/api/v2/assets?order_direction=asc{token_ids}&limit=30&collection={CollectionName}&format=json", headers=headers).text)
+    if i > 0:
+        limit += f"&next={next_param}"
+
+    data = json.loads(scraper.get(f"https://api.opensea.io/api/v2/collection/{CollectionName}/nfts?{limit}", headers=headers).text)
+
+    next_param = data.get('next', '')
     
     print(data)
 
-    if "assets" in data:
-        for asset in data["assets"]:
-            id = str(asset['token_id'])
+    if "nfts" in data:
+        for asset in data["nfts"]:
+            id = str(asset['identifier'])
 
             formatted_number = "0" * (len(str(count)) - len(id)) + id
 
@@ -157,8 +161,8 @@ for i in range(iter):
                 continue
             else:
                 # Make the request to the URL to get the image
-                if not asset["image_original_url"] is None:
-                    image_url = asset["image_original_url"]
+                if not asset["image_url"] is None:
+                    image_url = asset["image_url"]
                 elif not asset["image_url"] is None:
                     image_url = asset["image_url"]
                 else:
@@ -172,7 +176,7 @@ for i in range(iter):
                     continue
 
             # If the URL returned is IPFS, then change it to use a public gateway
-            if image_url.startswith("ipfs://"):
+            if image_url.startswith("https://ipfs.io/ipfs/"):
                 image_url = ipfs_resolve(image_url).url
 
             if len(image_url) == 0:

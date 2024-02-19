@@ -60,6 +60,31 @@ async def download_and_process_assets(collection_name, count):
         results = await asyncio.gather(*tasks)
         assets = [asset for sublist in results for asset in sublist]
         return assets
+    
+# If the metadata is desired then replace code with the snippet
+    """
+    async def download_and_process_assets(collection_name, count):
+    directory = os.path.join('images', collection_name, 'image_data')
+    os.makedirs(directory, exist_ok=True)
+
+    tasks = []
+    async with aiohttp.ClientSession() as session:
+        for offset in range(0, count, 200):
+            tasks.append(download_assets(session, collection_name, offset))
+
+        results = await asyncio.gather(*tasks)
+        assets = [asset for sublist in results for asset in sublist]
+
+        # Download JSON files
+        for asset in assets:
+            formatted_number = f"{asset['identifier']:05}"
+            json_file_path = os.path.join(directory, f"{formatted_number}.json")
+            if not os.path.exists(json_file_path):
+                with open(json_file_path, 'w') as json_file:
+                    json.dump(asset, json_file, indent=4)
+
+        return assets
+    """
 
 async def download_image(session, image_url, file_path):
     async with session.get(image_url) as response:

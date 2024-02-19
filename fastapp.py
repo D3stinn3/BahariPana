@@ -1,4 +1,5 @@
-import requests
+import asyncio
+import aiohttp
 import os
 import json
 import math
@@ -6,9 +7,6 @@ from random_user_agent.user_agent import UserAgent
 from random_user_agent.params import SoftwareName, OperatingSystem
 import cloudscraper
 import argparse
-import aiohttp
-import asyncio
-
 
 # This creates a new Scraper instance that can get past the OpenSea Cloudflare protections
 scraper = cloudscraper.create_scraper(
@@ -27,13 +25,6 @@ args = parser.parse_args()
 # This is where you add the collection name to the URL
 CollectionName = args.collection_name.lower()
 
-
-# Random User Agent
-software_names = [SoftwareName.CHROME.value]
-operating_systems = [OperatingSystem.WINDOWS.value, OperatingSystem.LINUX.value]
-user_agent_rotator = UserAgent(software_names=software_names, operating_systems=operating_systems, limit=100)
-user_agent = user_agent_rotator.get_random_user_agent()
-
 API_KEY = '795d349c0bea4fa19a71127d4554ec44'
 
 # Headers for the request. Currently this is generating random user agents
@@ -44,196 +35,67 @@ headers = {
 }
 
 # Get information regarding collection
+async def fetch_collection_info(session, collection_name):
+    url = f"http://api.opensea.io/api/v2/collections/{collection_name}?format=json"
+    async with session.get(url, headers=headers) as response:
+        return await response.json()
 
-collection = requests.get(f"http://api.opensea.io/api/v2/collections/{CollectionName}?format=json", headers=headers)
+async def download_collection_info(collection_name):
+    async with aiohttp.ClientSession() as session:
+        collection_info = await fetch_collection_info(session, collection_name)
+        return collection_info
 
-if collection.status_code == 429:
-    print("Server returned HTTP 429. Request was throttled. Please try again in about 5 minutes.")
-    exit()
+async def download_assets(session, collection_name, offset):
+    limit = f"limit=200&offset={offset}"
+    url = f"https://api.opensea.io/api/v2/collection/{collection_name}/nfts?{limit}"
+    async with session.get(url, headers=headers) as response:
+        data = await response.json()
+        return data.get('nfts', [])
 
-if collection.status_code == 404:
-    print("NFT Collection not found.\n\n(Hint: Try changing the name of the collection in the Python script, line 6.)")
-    exit()
+async def download_and_process_assets(collection_name, count):
+    tasks = []
+    async with aiohttp.ClientSession() as session:
+        for offset in range(0, count, 200):
+            tasks.append(download_assets(session, collection_name, offset))
+        results = await asyncio.gather(*tasks)
+        assets = [asset for sublist in results for asset in sublist]
+        return assets
 
-collectioninfo = json.loads(collection.content.decode())
-
-print(collectioninfo)
-
-# Create image folder if it doesn't exist.
-
-if not os.path.exists('./images'):
-    os.mkdir('./images')
-
-if not os.path.exists(f'./images/{CollectionName}'):
-    os.mkdir(f'./images/{CollectionName}')
-
-if not os.path.exists(f'./images/{CollectionName}/image_data'):
-    os.mkdir(f'./images/{CollectionName}/image_data')
-
-# Get total NFT count
-
-count = int(collectioninfo["total_supply"])
-# Opensea limits to 30 assets per API request, so here we do the division and round up.
-
-initial_count = count / 200
-
-iter = math.ceil(count / 200)
-
-print(f"\nBeginning download of \"{CollectionName}\" collection.\n")
-
-# Define variables for statistics
-
-stats = {
-    "DownloadedData": 0,
-    "AlreadyDownloadedData": 0,
-    "DownloadedImages": 0,
-    "AlreadyDownloadedImages": 0,
-    "FailedImages": 0
-}
-
-# Define IPFS Gateways
-
-ipfs_gateways = [
-    'cf-ipfs.com',
-    'gateway.ipfs.io',
-    'cloudflare-ipfs.com',
-    '10.via0.com',
-    'gateway.pinata.cloud',
-    'ipfs.cf-ipfs.com',
-    'ipfs.io',
-    'ipfs.sloppyta.co',
-    'ipfs.best-practice.se',
-    'snap1.d.tube',
-    'ipfs.greyh.at',
-    'ipfs.drink.cafe',
-    'ipfs.2read.net',
-    'robotizing.net',
-    'dweb.link',
-    'ninetailed.ninja'
-]
-
-
-# Create IPFS download function
-async def ipfs_resolve(session,image_url):
-    cid = image_url.removeprefix("https://ipfs.io/ipfs/")
-    for gateway in ipfs_gateways:
-        request = requests.get(f"https://{gateway}/ipfs/{cid}")
-        if request.status_code == 200:
-            break
-    return request
-
-async def download_image(session, image_url):
+async def download_image(session, image_url, file_path):
     async with session.get(image_url) as response:
         if response.status == 200:
-            content = await response.read()
-            with open(f"./images/{CollectionName}/{formatted_number}.png", "wb+") as file:
-                file.write(content)
+            with open(file_path, 'wb') as f:
+                f.write(await response.read())
 
+async def download_images(collection_name, assets):
+    # Create directory if it doesn't exist
+    directory = os.path.join('images', collection_name)
+    os.makedirs(directory, exist_ok=True)
 
-# Iterate through every unit
-async def download_nfts():
     async with aiohttp.ClientSession() as session:
-        for i in range(iter):
-            offset = i * 200
-            limit = f"limit=200&offset={offset}"
+        tasks = []
+        for asset in assets:
+            if not asset.get('image_url'):
+                continue
+            image_url = asset['image_url']
+            filename = os.path.join(directory, f"{asset['identifier']}.png")
+            tasks.append(download_image(session, image_url, filename))
+        await asyncio.gather(*tasks)
 
-            if i > 0:
-                limit += f"&next={next_param}"
+async def main():
+    collection_info = await download_collection_info(CollectionName)
+    count = int(collection_info.get("total_supply", 0))
+    if not count:
+        print("No collection found.")
+        return
 
-            data = json.loads(scraper.get(f"https://api.opensea.io/api/v2/collection/{CollectionName}/nfts?{limit}", headers=headers).text)
+    print(f"Beginning download of \"{CollectionName}\" collection.\n")
+    
+    assets = await download_and_process_assets(CollectionName, count)
+    await download_images(CollectionName, assets)
 
-            next_param = data.get('next', '')
-            
-            print(data)
+    print("Finished downloading collection.\n")
+    print("You can find the images in the images/{CollectionName} folder.")
 
-            if "nfts" in data:
-                for asset in data["nfts"]:
-                    id = str(asset['identifier'])
-
-                    formatted_number = "0" * (len(str(count)) - len(id)) + id
-
-                    print(f"\n#{formatted_number}:")
-
-                    # Check if data for the NFT already exists, if it does, skip saving it
-                    if os.path.exists(f'./images/{CollectionName}/image_data/{formatted_number}.json'):
-                        print(f"  Data  -> [\u2713] (Already Downloaded)")
-                        stats["AlreadyDownloadedData"] += 1
-                    else:
-                        # Take the JSON from the URL, and dump it to the respective file.
-                        dfile = open(f"./images/{CollectionName}/image_data/{formatted_number}.json", "w+")
-                        json.dump(asset, dfile, indent=3)
-                        dfile.close()
-                        print(f"  Data  -> [\u2713] (Successfully downloaded)")
-                        stats["DownloadedData"] += 1
-
-                    # Check if image already exists, if it does, skip saving it
-                    if os.path.exists(f'./images/{CollectionName}/{formatted_number}.png'):
-                        print(f"  Image -> [\u2713] (Already Downloaded)")
-                        stats["AlreadyDownloadedImages"] += 1
-                        continue
-                    else:
-                        # Make the request to the URL to get the image
-                        if not asset["image_url"] is None:
-                            image_url = asset["image_url"]
-                        elif not asset["image_url"] is None:
-                            image_url = asset["image_url"]
-                        else:
-                            image_url = ""
-
-                        if not len(image_url) == 0:
-                            image = requests.get(image_url)
-                        else:
-                            print(f"  Image -> [!] (Blank URL)")
-                            stats["FailedImages"] += 1
-                            continue
-
-                    # Replacement
-                    if image_url.startswith("https://ipfs.io/ipfs/"):
-                        image_data = await ipfs_resolve(session, image_url)
-                        if image_data:
-                            with open(f"./images/{CollectionName}/{formatted_number}.png", "+wb") as image_file:
-                                image_file.write(image_data)
-                            print(f" Image -> [\u2713] (Successfully downloaded)")
-                            stats["DownloadedImages"] += 1
-
-                        else:
-                            print(f" Image -> [!] (Failed to download from IPFS)")
-                            stats["FailedImages"] += 1
-                            continue
-
-                    else:
-                        # Download image asynchronously
-                        tasks.append(download_image(session, image_url))
-
-                await asyncio.gather(*tasks)
-
-asyncio.run(download_nfts())
-
-
-
-print(f"""
-
-Finished downloading collection.
-
-
-Statistics
--=-=-=-=-=-
-
-Total of {count} units in collection "{CollectionName}".
-
-Downloads:
-
-    JSON Files ->
-    {stats["DownloadedData"]} successfully downloaded
-    {stats["AlreadyDownloadedData"]} already downloaded
-
-    Images ->
-    {stats["DownloadedImages"]} successfully downloaded
-    {stats["AlreadyDownloadedImages"]} already downloaded
-    {stats["FailedImages"]} failed
-
-
-You can find the images in the images/{CollectionName} folder.
-The JSON for each NFT can be found in the images/{CollectionName}/image_data folder.
-Press enter to exit...""")
-input()
+if __name__ == "__main__":
+    asyncio.run(main())

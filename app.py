@@ -2,6 +2,7 @@ import requests
 import os
 import json
 import math
+from urllib.parse import urlparse
 from random_user_agent.user_agent import UserAgent
 from random_user_agent.params import SoftwareName, OperatingSystem
 import cloudscraper
@@ -113,12 +114,106 @@ ipfs_gateways = [
 # Create IPFS download function
 def ipfs_resolve(image_url):
     cid = image_url.removeprefix("https://ipfs.io/ipfs/")
+    request = None
     for gateway in ipfs_gateways:
-        request = requests.get(f"https://{gateway}/ipfs/{cid}")
+        request = requests.get(f"https://{gateway}/ipfs/{cid}", headers=headers, timeout=30)
         if request.status_code == 200:
             break
     return request
 
+
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg')
+
+CONTENT_TYPE_TO_EXT = {
+    'image/png': '.png',
+    'image/jpeg': '.jpg',
+    'image/jpg': '.jpg',
+    'image/webp': '.webp',
+    'image/gif': '.gif',
+    'image/svg+xml': '.svg',
+}
+
+
+def resolve_image_url(asset):
+    for key in ('display_image_url', 'image_url'):
+        url = asset.get(key)
+        if url:
+            return url
+    return ''
+
+
+def extension_from_url(url):
+    path = urlparse(url).path.lower()
+    for ext in IMAGE_EXTENSIONS:
+        if path.endswith(ext):
+            return '.jpg' if ext == '.jpeg' else ext
+    return None
+
+
+def extension_from_content_type(content_type):
+    if not content_type:
+        return None
+    mime = content_type.split(';')[0].strip().lower()
+    return CONTENT_TYPE_TO_EXT.get(mime)
+
+
+def extension_from_magic(body):
+    if not body:
+        return None
+    if body[:8] == b'\x89PNG\r\n\x1a\n':
+        return '.png'
+    if body[:3] == b'\xff\xd8\xff':
+        return '.jpg'
+    if body[:6] in (b'GIF87a', b'GIF89a'):
+        return '.gif'
+    if len(body) >= 12 and body[:4] == b'RIFF' and body[8:12] == b'WEBP':
+        return '.webp'
+    head = body[:512].lstrip()
+    if head.startswith(b'<svg') or head.startswith(b'<?xml'):
+        return '.svg'
+    return None
+
+
+def guess_extension(image_url, content_type, body):
+    ext = extension_from_url(image_url)
+    if ext:
+        return ext
+    ext = extension_from_content_type(content_type)
+    if ext:
+        return ext
+    ext = extension_from_magic(body)
+    if ext:
+        return ext
+    return '.png'
+
+
+def is_fake_png(path):
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(512).lstrip()
+        return head.startswith(b'<svg') or head.startswith(b'<?xml')
+    except OSError:
+        return False
+
+
+def image_already_downloaded(collection_dir, formatted_number):
+    for ext in IMAGE_EXTENSIONS:
+        path = os.path.join(collection_dir, f'{formatted_number}{ext}')
+        if not os.path.exists(path):
+            continue
+        if ext == '.png' and is_fake_png(path):
+            continue
+        return path
+    return None
+
+
+def fetch_image(image_url):
+    if image_url.startswith('https://ipfs.io/ipfs/'):
+        return ipfs_resolve(image_url)
+    return requests.get(image_url, headers=headers, timeout=30)
+
+
+collection_dir = f'./images/{CollectionName}'
 
 # Iterate through every unit
 for i in range(iter):
@@ -154,50 +249,32 @@ for i in range(iter):
                 print(f"  Data  -> [\u2713] (Successfully downloaded)")
                 stats["DownloadedData"] += 1
 
-            # Check if image already exists, if it does, skip saving it
-            if os.path.exists(f'./images/{CollectionName}/{formatted_number}.png'):
-                print(f"  Image -> [\u2713] (Already Downloaded)")
+            existing_image = image_already_downloaded(collection_dir, formatted_number)
+            if existing_image:
+                ext = os.path.splitext(existing_image)[1]
+                print(f"  Image -> [\u2713] (Already Downloaded{ext})")
                 stats["AlreadyDownloadedImages"] += 1
                 continue
-            else:
-                # Make the request to the URL to get the image
-                if not asset["display_image_url"] is None:
-                    image_url = asset["display_image_url"]
-                elif not asset["display_image_url"] is None:
-                    image_url = asset["display_image_url"]
-                else:
-                    image_url = ""
 
-                if not len(image_url) == 0:
-                    image = requests.get(image_url)
-                else:
-                    print(f"  Image -> [!] (Blank URL)")
-                    stats["FailedImages"] += 1
-                    continue
-
-            # If the URL returned is IPFS, then change it to use a public gateway
-            if image_url.startswith("https://ipfs.io/ipfs/"):
-                image_url = ipfs_resolve(image_url).url
-
-            if len(image_url) == 0:
+            image_url = resolve_image_url(asset)
+            if not image_url:
                 print(f"  Image -> [!] (Blank URL)")
                 stats["FailedImages"] += 1
                 continue
 
-            image = requests.get(image_url)
-
-            # If the URL returns status code "200 Successful", save the image into the "images" folder.
-            if image.status_code == 200:
-                file = open(f"./images/{CollectionName}/{formatted_number}.png", "wb+")
-                file.write(image.content)
-                file.close()
-                print(f"  Image -> [\u2713] (Successfully downloaded)")
-                stats["DownloadedImages"] += 1
-            # If the URL returns a status code other than "200 Successful", alert the user and don't save the image
-            else:
-                print(f"  Image -> [!] (HTTP Status {image.status_code})")
+            image = fetch_image(image_url)
+            if image is None or image.status_code != 200:
+                status = image.status_code if image is not None else 'unknown'
+                print(f"  Image -> [!] (HTTP Status {status})")
                 stats["FailedImages"] += 1
                 continue
+
+            ext = guess_extension(image_url, image.headers.get('Content-Type'), image.content)
+            out_path = os.path.join(collection_dir, f'{formatted_number}{ext}')
+            with open(out_path, 'wb') as file:
+                file.write(image.content)
+            print(f"  Image -> [\u2713] (Successfully downloaded as {ext})")
+            stats["DownloadedImages"] += 1
 
 print(f"""
 
@@ -222,6 +299,7 @@ Downloads:
 
 
 You can find the images in the images/{CollectionName} folder.
+Images are saved with the correct extension (.png, .svg, .jpg, etc.) for each token.
 The JSON for each NFT can be found in the images/{CollectionName}/image_data folder.
 Press enter to exit...""")
 input()

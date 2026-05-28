@@ -31,7 +31,7 @@ operating_systems = [OperatingSystem.WINDOWS.value, OperatingSystem.LINUX.value]
 user_agent_rotator = UserAgent(software_names=software_names, operating_systems=operating_systems, limit=100)
 user_agent = user_agent_rotator.get_random_user_agent()
 
-API_KEY = '795d349c0bea4fa19a71127d4554ec44'
+API_KEY = '2dc6ee15cbe543a9bf57cc27769c79eb'
 
 # Headers for the request. Currently this is generating random user agents
 # Use a custom header version here -> https://www.whatismybrowser.com/guides/the-latest-user-agent/
@@ -161,10 +161,10 @@ for i in range(iter):
                 continue
             else:
                 # Make the request to the URL to get the image
-                if not asset["image_url"] is None:
-                    image_url = asset["image_url"]
-                elif not asset["image_url"] is None:
-                    image_url = asset["image_url"]
+                if not asset["display_image_url"] is None:
+                    image_url = asset["display_image_url"]
+                elif not asset["display_image_url"] is None:
+                    image_url = asset["display_image_url"]
                 else:
                     image_url = ""
 

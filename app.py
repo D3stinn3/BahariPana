@@ -1,14 +1,14 @@
-import requests
-import os
-import json
-import math
-from urllib.parse import urlparse
-from random_user_agent.user_agent import UserAgent
-from random_user_agent.params import SoftwareName, OperatingSystem
-import cloudscraper
 import argparse
+import json
+import os
+import time
+from urllib.parse import urlparse
 
-# This creates a new Scraper instance that can get past the OpenSea Cloudflare protections
+import cloudscraper
+import requests
+from requests.exceptions import ConnectionError, RequestException, Timeout
+
+# Bypass OpenSea Cloudflare when API key alone is not accepted
 scraper = cloudscraper.create_scraper(
     browser={
         'browser': 'firefox',
@@ -17,79 +17,65 @@ scraper = cloudscraper.create_scraper(
     }
 )
 
-# get collection name from arguments
+OPENSEA_API_BASE = 'https://api.opensea.io'
+RETRYABLE_STATUS_CODES = {429, 502, 503, 504, 599}
+DEFAULT_MAX_RETRIES = 5
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 200
+DEFAULT_IMAGE_DELAY = 0.35
+DEFAULT_PAGE_DELAY = 1.5
+
 parser = argparse.ArgumentParser(description='Mass download the metadata & images for a collection of NFTs')
-parser.add_argument('collection_name', action='store', type=str, help='collection name to parse')
+parser.add_argument('collection_name', action='store', type=str, help='collection name (OpenSea slug)')
+parser.add_argument(
+    '--page-size',
+    type=int,
+    default=DEFAULT_PAGE_SIZE,
+    help=f'NFTs per OpenSea API page (1-{MAX_PAGE_SIZE}, default: {DEFAULT_PAGE_SIZE})',
+)
+parser.add_argument(
+    '--delay',
+    type=float,
+    default=DEFAULT_IMAGE_DELAY,
+    help=f'Seconds to wait after each image download (default: {DEFAULT_IMAGE_DELAY})',
+)
+parser.add_argument(
+    '--page-delay',
+    type=float,
+    default=DEFAULT_PAGE_DELAY,
+    help=f'Seconds to wait between OpenSea list pages (default: {DEFAULT_PAGE_DELAY})',
+)
+parser.add_argument(
+    '--max-retries',
+    type=int,
+    default=DEFAULT_MAX_RETRIES,
+    help=f'Max retry attempts per HTTP request (default: {DEFAULT_MAX_RETRIES})',
+)
 args = parser.parse_args()
 
-# This is where you add the collection name to the URL
+if not 1 <= args.page_size <= MAX_PAGE_SIZE:
+    parser.error(f'--page-size must be between 1 and {MAX_PAGE_SIZE}')
+
 CollectionName = args.collection_name.lower()
-
-
-# Random User Agent
-software_names = [SoftwareName.CHROME.value]
-operating_systems = [OperatingSystem.WINDOWS.value, OperatingSystem.LINUX.value]
-user_agent_rotator = UserAgent(software_names=software_names, operating_systems=operating_systems, limit=100)
-user_agent = user_agent_rotator.get_random_user_agent()
 
 API_KEY = '2dc6ee15cbe543a9bf57cc27769c79eb'
 
-# Headers for the request. Currently this is generating random user agents
-# Use a custom header version here -> https://www.whatismybrowser.com/guides/the-latest-user-agent/
 headers = {
-    'User-Agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_2_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36",
-    'X-API-KEY': API_KEY
+    'User-Agent': (
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 12_2_1) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36'
+    ),
+    'X-API-KEY': API_KEY,
 }
-
-# Get information regarding collection
-
-collection = requests.get(f"http://api.opensea.io/api/v2/collections/{CollectionName}?format=json", headers=headers)
-
-if collection.status_code == 429:
-    print("Server returned HTTP 429. Request was throttled. Please try again in about 5 minutes.")
-    exit()
-
-if collection.status_code == 404:
-    print("NFT Collection not found.\n\n(Hint: Try changing the name of the collection in the Python script, line 6.)")
-    exit()
-
-collectioninfo = json.loads(collection.content.decode())
-
-print(collectioninfo)
-
-# Create image folder if it doesn't exist.
-
-if not os.path.exists('./images'):
-    os.mkdir('./images')
-
-if not os.path.exists(f'./images/{CollectionName}'):
-    os.mkdir(f'./images/{CollectionName}')
-
-if not os.path.exists(f'./images/{CollectionName}/image_data'):
-    os.mkdir(f'./images/{CollectionName}/image_data')
-
-# Get total NFT count
-
-count = int(collectioninfo["total_supply"])
-# Opensea limits to 30 assets per API request, so here we do the division and round up.
-
-initial_count = count / 200
-
-iter = math.ceil(count / 200)
-
-print(f"\nBeginning download of \"{CollectionName}\" collection.\n")
-
-# Define variables for statistics
 
 stats = {
-    "DownloadedData": 0,
-    "AlreadyDownloadedData": 0,
-    "DownloadedImages": 0,
-    "AlreadyDownloadedImages": 0,
-    "FailedImages": 0
+    'DownloadedData': 0,
+    'AlreadyDownloadedData': 0,
+    'DownloadedImages': 0,
+    'AlreadyDownloadedImages': 0,
+    'FailedImages': 0,
+    'PagesProcessed': 0,
 }
-
-# Define IPFS Gateways
 
 ipfs_gateways = [
     'cf-ipfs.com',
@@ -107,20 +93,8 @@ ipfs_gateways = [
     'ipfs.2read.net',
     'robotizing.net',
     'dweb.link',
-    'ninetailed.ninja'
+    'ninetailed.ninja',
 ]
-
-
-# Create IPFS download function
-def ipfs_resolve(image_url):
-    cid = image_url.removeprefix("https://ipfs.io/ipfs/")
-    request = None
-    for gateway in ipfs_gateways:
-        request = requests.get(f"https://{gateway}/ipfs/{cid}", headers=headers, timeout=30)
-        if request.status_code == 200:
-            break
-    return request
-
 
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg')
 
@@ -132,6 +106,94 @@ CONTENT_TYPE_TO_EXT = {
     'image/gif': '.gif',
     'image/svg+xml': '.svg',
 }
+
+
+def parse_retry_after(response):
+    retry_after = response.headers.get('Retry-After')
+    if retry_after is None:
+        return None
+    try:
+        return int(retry_after)
+    except ValueError:
+        return None
+
+
+def retry_wait(attempt, response=None):
+    if response is not None:
+        header_wait = parse_retry_after(response)
+        if header_wait is not None:
+            return min(header_wait, 60)
+    return min(2 ** attempt, 60)
+
+
+def request_with_retry(method, url, *, use_scraper=False, max_retries=None, **kwargs):
+    max_retries = max_retries if max_retries is not None else args.max_retries
+    kwargs.setdefault('headers', headers)
+    kwargs.setdefault('timeout', 30)
+
+    last_exception = None
+    last_response = None
+    client = scraper if use_scraper else requests
+
+    for attempt in range(max_retries):
+        try:
+            response = client.request(method, url, **kwargs)
+            last_response = response
+
+            if response.status_code in RETRYABLE_STATUS_CODES:
+                wait = retry_wait(attempt, response)
+                print(
+                    f'  [!] HTTP {response.status_code}, retrying in {wait}s '
+                    f'(attempt {attempt + 1}/{max_retries})'
+                )
+                time.sleep(wait)
+                continue
+
+            return response
+
+        except (ConnectionError, Timeout) as exc:
+            last_exception = exc
+            wait = retry_wait(attempt)
+            print(
+                f'  [!] Connection error, retrying in {wait}s '
+                f'(attempt {attempt + 1}/{max_retries}): {exc}'
+            )
+            time.sleep(wait)
+
+    if last_exception is not None:
+        raise last_exception
+    return last_response
+
+
+def opensea_get(path, params=None):
+    url = f'{OPENSEA_API_BASE}{path}'
+    response = request_with_retry('GET', url, params=params, use_scraper=False)
+    if response is not None and response.status_code == 403:
+        response = request_with_retry('GET', url, params=params, use_scraper=True)
+    return response
+
+
+def fetch_collection_page(next_cursor=None):
+    params = {'limit': args.page_size}
+    if next_cursor:
+        params['next'] = next_cursor
+    return opensea_get(f'/api/v2/collection/{CollectionName}/nfts', params=params)
+
+
+def ipfs_resolve(image_url):
+    cid = image_url.removeprefix('https://ipfs.io/ipfs/')
+    request = None
+    for gateway in ipfs_gateways:
+        try:
+            request = request_with_retry(
+                'GET',
+                f'https://{gateway}/ipfs/{cid}',
+            )
+            if request.status_code == 200:
+                break
+        except RequestException:
+            continue
+    return request
 
 
 def resolve_image_url(asset):
@@ -210,96 +272,177 @@ def image_already_downloaded(collection_dir, formatted_number):
 def fetch_image(image_url):
     if image_url.startswith('https://ipfs.io/ipfs/'):
         return ipfs_resolve(image_url)
-    return requests.get(image_url, headers=headers, timeout=30)
+    try:
+        return request_with_retry('GET', image_url)
+    except RequestException:
+        return None
 
 
+def process_nft(asset, count, collection_dir):
+    token_id = str(asset['identifier'])
+    formatted_number = '0' * (len(str(count)) - len(token_id)) + token_id
+
+    print(f'\n#{formatted_number}:')
+
+    json_path = os.path.join(collection_dir, 'image_data', f'{formatted_number}.json')
+    if os.path.exists(json_path):
+        print('  Data  -> [\u2713] (Already Downloaded)')
+        stats['AlreadyDownloadedData'] += 1
+    else:
+        with open(json_path, 'w', encoding='utf-8') as dfile:
+            json.dump(asset, dfile, indent=3)
+        print('  Data  -> [\u2713] (Successfully downloaded)')
+        stats['DownloadedData'] += 1
+
+    existing_image = image_already_downloaded(collection_dir, formatted_number)
+    if existing_image:
+        ext = os.path.splitext(existing_image)[1]
+        print(f'  Image -> [\u2713] (Already Downloaded{ext})')
+        stats['AlreadyDownloadedImages'] += 1
+        return
+
+    image_url = resolve_image_url(asset)
+    if not image_url:
+        print('  Image -> [!] (Blank URL)')
+        stats['FailedImages'] += 1
+        return
+
+    image = fetch_image(image_url)
+    if args.delay > 0:
+        time.sleep(args.delay)
+
+    if image is None or image.status_code != 200:
+        status = image.status_code if image is not None else 'unknown'
+        print(f'  Image -> [!] (HTTP Status {status})')
+        stats['FailedImages'] += 1
+        return
+
+    ext = guess_extension(image_url, image.headers.get('Content-Type'), image.content)
+    out_path = os.path.join(collection_dir, f'{formatted_number}{ext}')
+    with open(out_path, 'wb') as file:
+        file.write(image.content)
+    print(f'  Image -> [\u2713] (Successfully downloaded as {ext})')
+    stats['DownloadedImages'] += 1
+
+
+# --- Fetch collection metadata ---
+try:
+    collection = opensea_get(f'/api/v2/collections/{CollectionName}', params={'format': 'json'})
+except RequestException as exc:
+    print(f'Failed to reach OpenSea API: {exc}')
+    raise SystemExit(1) from exc
+
+if collection is None:
+    print('Failed to reach OpenSea API after retries.')
+    raise SystemExit(1)
+
+if collection.status_code == 429:
+    print('Server returned HTTP 429. Request was throttled. Please try again in about 5 minutes.')
+    raise SystemExit(1)
+
+if collection.status_code == 404:
+    print(
+        'NFT Collection not found.\n\n'
+        f'(Hint: Check the collection slug "{CollectionName}" matches OpenSea.)'
+    )
+    raise SystemExit(1)
+
+if collection.status_code != 200:
+    print(f'OpenSea API returned HTTP {collection.status_code} for collection metadata.')
+    raise SystemExit(1)
+
+collectioninfo = collection.json()
+count = int(collectioninfo['total_supply'])
+collection_label = collectioninfo.get('name', CollectionName)
+
+print(f'Collection: {collection_label} (reported supply: {count})')
+
+# --- Prepare output directories ---
+os.makedirs('./images', exist_ok=True)
 collection_dir = f'./images/{CollectionName}'
+os.makedirs(collection_dir, exist_ok=True)
+os.makedirs(f'{collection_dir}/image_data', exist_ok=True)
 
-# Iterate through every unit
-for i in range(iter):
-    offset = i * 200
-    limit = f"limit=200&offset={offset}"
+print(
+    f'\nBeginning download of "{CollectionName}" '
+    f'(page size: {args.page_size}, image delay: {args.delay}s, page delay: {args.page_delay}s).\n'
+)
 
-    if i > 0:
-        limit += f"&next={next_param}"
+# --- Paginate with cursor (OpenSea API v2) ---
+page_index = 0
+next_cursor = None
+run_status = 'completed'
+exit_code = 0
 
-    data = json.loads(scraper.get(f"https://api.opensea.io/api/v2/collection/{CollectionName}/nfts?{limit}", headers=headers).text)
+while True:
+    page_index += 1
 
-    next_param = data.get('next', '')
-    
-    print(data)
+    try:
+        response = fetch_collection_page(next_cursor)
+    except RequestException as exc:
+        print(f'\n[!] Failed to fetch NFT page {page_index} after retries: {exc}')
+        print('Re-run the same command to resume from already downloaded files.')
+        run_status = 'interrupted'
+        exit_code = 1
+        break
 
-    if "nfts" in data:
-        for asset in data["nfts"]:
-            id = str(asset['identifier'])
+    if response is None or response.status_code != 200:
+        status = response.status_code if response is not None else 'unknown'
+        print(f'\n[!] OpenSea API returned HTTP {status} on page {page_index}.')
+        print('Re-run the same command to resume from already downloaded files.')
+        run_status = 'interrupted'
+        exit_code = 1
+        break
 
-            formatted_number = "0" * (len(str(count)) - len(id)) + id
+    data = response.json()
+    nfts = data.get('nfts', [])
+    stats['PagesProcessed'] = page_index
+    print(f'\n--- Page {page_index}: {len(nfts)} NFTs ---')
 
-            print(f"\n#{formatted_number}:")
+    for asset in nfts:
+        try:
+            process_nft(asset, count, collection_dir)
+        except Exception as exc:
+            token_id = asset.get('identifier', '?')
+            print(f'  [!] Unexpected error on token {token_id}: {exc}')
+            stats['FailedImages'] += 1
 
-            # Check if data for the NFT already exists, if it does, skip saving it
-            if os.path.exists(f'./images/{CollectionName}/image_data/{formatted_number}.json'):
-                print(f"  Data  -> [\u2713] (Already Downloaded)")
-                stats["AlreadyDownloadedData"] += 1
-            else:
-                # Take the JSON from the URL, and dump it to the respective file.
-                dfile = open(f"./images/{CollectionName}/image_data/{formatted_number}.json", "w+")
-                json.dump(asset, dfile, indent=3)
-                dfile.close()
-                print(f"  Data  -> [\u2713] (Successfully downloaded)")
-                stats["DownloadedData"] += 1
+    next_cursor = data.get('next')
+    if not next_cursor or not nfts:
+        break
 
-            existing_image = image_already_downloaded(collection_dir, formatted_number)
-            if existing_image:
-                ext = os.path.splitext(existing_image)[1]
-                print(f"  Image -> [\u2713] (Already Downloaded{ext})")
-                stats["AlreadyDownloadedImages"] += 1
-                continue
-
-            image_url = resolve_image_url(asset)
-            if not image_url:
-                print(f"  Image -> [!] (Blank URL)")
-                stats["FailedImages"] += 1
-                continue
-
-            image = fetch_image(image_url)
-            if image is None or image.status_code != 200:
-                status = image.status_code if image is not None else 'unknown'
-                print(f"  Image -> [!] (HTTP Status {status})")
-                stats["FailedImages"] += 1
-                continue
-
-            ext = guess_extension(image_url, image.headers.get('Content-Type'), image.content)
-            out_path = os.path.join(collection_dir, f'{formatted_number}{ext}')
-            with open(out_path, 'wb') as file:
-                file.write(image.content)
-            print(f"  Image -> [\u2713] (Successfully downloaded as {ext})")
-            stats["DownloadedImages"] += 1
+    if args.page_delay > 0:
+        time.sleep(args.page_delay)
 
 print(f"""
 
-Finished downloading collection.
+Finished downloading collection ({run_status}).
 
 
 Statistics
 -=-=-=-=-=-
 
-Total of {count} units in collection "{CollectionName}".
+Collection "{CollectionName}" (reported supply: {count}).
+API pages processed: {stats['PagesProcessed']}
 
 Downloads:
 
     JSON Files ->
-    {stats["DownloadedData"]} successfully downloaded
-    {stats["AlreadyDownloadedData"]} already downloaded
+    {stats['DownloadedData']} successfully downloaded
+    {stats['AlreadyDownloadedData']} already downloaded
 
     Images ->
-    {stats["DownloadedImages"]} successfully downloaded
-    {stats["AlreadyDownloadedImages"]} already downloaded
-    {stats["FailedImages"]} failed
+    {stats['DownloadedImages']} successfully downloaded
+    {stats['AlreadyDownloadedImages']} already downloaded
+    {stats['FailedImages']} failed
 
 
 You can find the images in the images/{CollectionName} folder.
 Images are saved with the correct extension (.png, .svg, .jpg, etc.) for each token.
 The JSON for each NFT can be found in the images/{CollectionName}/image_data folder.
+
+If the run was interrupted, re-run: python app.py {CollectionName}
 Press enter to exit...""")
+
 input()
+raise SystemExit(exit_code)
